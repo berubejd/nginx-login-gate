@@ -1,0 +1,125 @@
+# Rendered by the entrypoint (envsubst) to /etc/nginx/conf.d/gate.conf.
+# Included inside the http {} block of /etc/nginx/nginx.conf.
+
+js_path "/etc/nginx/gate/";
+js_import gate from gate.js;
+
+# Username of the authenticated caller, or "" if not authenticated.
+js_set $gate_user gate.user;
+
+# Authorization header minus gate credentials (see gate.js)
+js_set $gate_upstream_authorization gate.upstreamAuthorization;
+
+# Rate-limit login attempts (POSTs only; viewing the page is not limited).
+map $request_method $gate_login_limit_key {
+    POST    $binary_remote_addr;
+    default "";
+}
+limit_req_zone $gate_login_limit_key zone=gate_login:10m rate=10r/m;
+
+# X-Forwarded-For to send upstream when TRUST_PROXY_HEADERS=true:
+# the proxy's chain, plus the proxy hop that connected to us.
+map $http_x_forwarded_for $gate_xff_trusted {
+    ""      $realip_remote_addr;
+    default "$http_x_forwarded_for, $realip_remote_addr";
+}
+
+# Scheme to report when TRUST_PROXY_HEADERS=true. The last X-Forwarded-Proto
+# entry is the one the trusted proxy added (or the only entry, if it replaced
+# the header). Anything else falls back to this gate's own connection scheme.
+map $http_x_forwarded_proto $gate_xfp_last {
+    ""      "";
+    default "";
+    "~*([^,\s]+)\s*$" $1;
+}
+map $gate_xfp_last $gate_xfp_trusted {
+    "~*^https$" https;
+    "~*^http$"  http;
+    default     $scheme;
+}
+
+# Connection header that works for both WebSocket and regular HTTP
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+
+    server_tokens off;
+
+    # Real client IP from X-Forwarded-For (empty when TRUST_PROXY_HEADERS=false)
+    include /etc/nginx/snippets/gate_realip.conf;
+    # Keep redirects relative so they work behind Railway's TLS proxy
+    absolute_redirect off;
+
+    # $gate_xfp_trusted when TRUST_PROXY_HEADERS=true, otherwise $scheme.
+    # The login cookie's Secure flag uses this same value.
+    set $gate_proto ${GATE_XFP};
+
+    # DNS resolver - configured by the entrypoint (Railway uses IPv6 internal DNS)
+    resolver ${DNS_RESOLVER} valid=300s;
+    resolver_timeout 5s;
+
+    # Upstream is supplied via env var ORIGIN (e.g. http://app.railway.internal:3000)
+    set $upstream "${ORIGIN}";
+
+    client_max_body_size 50m;
+
+    # ---- Gate endpoints (never proxied, never require auth) ----
+    location = /_gate/login {
+        limit_req zone=gate_login burst=10 nodelay;
+        limit_req_status 429;
+        error_page 429 = @gate_rate_limited;
+        client_max_body_size 16k;
+        client_body_buffer_size 16k;
+        js_content gate.login;
+    }
+
+    location = /_gate/logout {
+        js_content gate.logout;
+    }
+
+    location ^~ /_gate/ {
+        return 404;
+    }
+
+    location @gate_unauthorized {
+        js_content gate.unauthorized;
+    }
+
+    location @gate_rate_limited {
+        js_content gate.rateLimited;
+    }
+
+    # ---- Everything else is proxied to ORIGIN ----
+    location / {
+        # Auth check (empty when ALLOW_NO_AUTH=true and no users are set)
+        include /etc/nginx/snippets/gate_check.conf;
+        error_page 401 = @gate_unauthorized;
+
+        proxy_http_version 1.1;
+
+        # For HTTPS upstreams, send the upstream host for SSL cert validation
+        proxy_ssl_server_name on;
+        proxy_ssl_name $proxy_host;
+
+        proxy_set_header Host $proxy_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For ${GATE_XFF};
+        proxy_set_header X-Forwarded-Proto $gate_proto;
+        proxy_set_header X-Forwarded-Host $host;
+
+        # Who is signed in. Always overwritten, so clients can't spoof it.
+        proxy_set_header X-Forwarded-User $gate_user;
+        proxy_set_header Authorization $gate_upstream_authorization;
+
+        # WebSocket support
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+
+        proxy_pass $upstream;
+    }
+}
