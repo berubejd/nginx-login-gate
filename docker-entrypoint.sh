@@ -108,9 +108,14 @@ else
   log "Not trusting proxy headers - client IP is the direct TCP peer, scheme is the gate connection"
 fi
 
-# ---------- DNS resolver (from the original project) ----------
-# Railway uses IPv6 DNS for private networking
-DNS_RESOLVER="127.0.0.11 8.8.8.8 8.8.4.4"
+# ---------- DNS resolver ----------
+# nginx queries the resolver list round-robin, one server per lookup, and
+# treats NXDOMAIN as a final answer. It does not fall through to the next
+# server. Public resolvers cannot answer private names (*.railway.internal,
+# Docker service names), so they must not be mixed in with the container's
+# own nameserver. /etc/resolv.conf "search" domains are also ignored; ORIGIN
+# has to be a name that nameserver can answer as written.
+DNS_RESOLVER=""
 if [[ -f /etc/resolv.conf ]]; then
   FORMATTED_NAMESERVERS=""
   while IFS= read -r nameserver; do
@@ -122,11 +127,14 @@ if [[ -f /etc/resolv.conf ]]; then
       fi
     fi
   done <<< "$(grep '^nameserver' /etc/resolv.conf | awk '{print $2}')"
+  DNS_RESOLVER="${FORMATTED_NAMESERVERS# }"
+fi
 
-  if [[ -n "$FORMATTED_NAMESERVERS" ]]; then
-    DNS_RESOLVER="$FORMATTED_NAMESERVERS 8.8.8.8 8.8.4.4"
-    log "Using system DNS resolvers:$FORMATTED_NAMESERVERS"
-  fi
+if [[ -n "$DNS_RESOLVER" ]]; then
+  log "Using system DNS resolvers: $DNS_RESOLVER"
+else
+  DNS_RESOLVER="8.8.8.8 8.8.4.4"
+  log "WARNING: no nameserver in /etc/resolv.conf, using public DNS. Private hostnames such as *.railway.internal will not resolve."
 fi
 
 # ---------- Render nginx config ----------

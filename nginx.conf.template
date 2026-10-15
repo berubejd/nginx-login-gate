@@ -59,8 +59,10 @@ server {
     # The login cookie's Secure flag uses this same value.
     set $gate_proto ${GATE_XFP};
 
-    # DNS resolver - configured by the entrypoint (Railway uses IPv6 internal DNS)
-    resolver ${DNS_RESOLVER} valid=300s;
+    # DNS resolver - configured by the entrypoint (Railway uses IPv6 internal DNS).
+    # valid= overrides the record TTL. Keep it short so a replaced Railway
+    # private address is not used for minutes after the upstream moves.
+    resolver ${DNS_RESOLVER} valid=10s;
     resolver_timeout 5s;
 
     # Upstream is supplied via env var ORIGIN (e.g. http://app.railway.internal:3000)
